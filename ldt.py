@@ -69,8 +69,11 @@ from typing import Iterator, Optional
 MAGIC           = b"LDT\x01"
 HDR_FMT         = "!4sBI"
 HDR_SIZE        = struct.calcsize(HDR_FMT)   # 9 bytes
-CHUNK_HDR_FMT   = "!I32sI"
-CHUNK_HDR_SIZE  = struct.calcsize(CHUNK_HDR_FMT)  # 40 bytes
+# CHUNK header includes a flags byte: 0x01 = zlib compressed, 0x00 = raw
+CHUNK_HDR_FMT   = "!I32sIB"  # index(4) sha256(32) datalen(4) flags(1)
+CHUNK_HDR_SIZE  = struct.calcsize(CHUNK_HDR_FMT)  # 41 bytes
+FLAG_COMPRESSED = 0x01
+FLAG_RAW        = 0x00
 
 TCP_PORT        = 9900
 MCAST_GROUP     = "239.255.42.42"
@@ -79,9 +82,11 @@ DISC_INTERVAL   = 5.0
 PEER_TTL        = 30.0
 
 # Chunk / socket tuning
-CHUNK_SIZE      = 2 * 1024 * 1024   # 2 MiB — reduces overhead vs 512 KiB
-SOCK_BUF        = 8 * 1024 * 1024   # 8 MiB socket buffer
-MAX_RETRY_FILES = 3                  # whole-file retries on hash mismatch
+CHUNK_SIZE      = 2 * 1024 * 1024   # 2 MiB per chunk
+SOCK_BUF        = 16 * 1024 * 1024  # 16 MiB — important for high-latency WiFi
+MAX_RETRY_FILES = 3
+# Compression: probe ratio on first chunk; skip zlib if gain < this threshold
+COMPRESS_MIN_GAIN = 0.05   # need at least 5% size reduction to bother
 
 # Message types
 T_HELLO        = 0x01
@@ -373,24 +378,43 @@ def _send_session(sock: socket.socket, entries: list[FileEntry],
 def _send_file(sock: socket.socket, idx: int, entry: FileEntry,
                quiet: bool, attempt: int = 0) -> None:
     """Stream one file; retry on whole-file hash mismatch (up to MAX_RETRY_FILES)."""
+
+    # ── decide whether to compress this file ─────────────────────────────────
+    # Probe the first CHUNK_SIZE bytes. If zlib saves < COMPRESS_MIN_GAIN,
+    # skip compression entirely — big win for video/zip/jpg/etc.
+    use_compress = True
+    if entry.size > 0:
+        probe_size = min(entry.size, CHUNK_SIZE)
+        with open(entry.abs_path, "rb") as fh:
+            probe = fh.read(probe_size)
+        probe_comp = _compress(probe)
+        ratio = 1.0 - len(probe_comp) / len(probe)
+        use_compress = ratio >= COMPRESS_MIN_GAIN
+        if not use_compress:
+            log.debug("%s: skipping compression (ratio %.1f%%)", entry.rel_path, ratio * 100)
+
     meta = json.dumps({
         "i": idx, "p": entry.rel_path,
         "s": entry.size, "c": entry.chunks, "m": entry.mtime,
         "retry": attempt,
+        "nc": not use_compress,   # nc=True means no compression used
     }).encode()
     _send_frame(sock, T_FILE_META, meta)
 
     # ── pipeline: send all chunks without waiting for per-chunk ACK ──────────
     prog = None if quiet else Progress(entry.rel_path, entry.size)
     file_hasher = hashlib.sha256()
-    chunk_hashes: list[bytes] = []
 
     for ci, raw in enumerate(_read_chunks(entry.abs_path)):
         file_hasher.update(raw)
         chunk_hash = _sha256(raw)
-        chunk_hashes.append(chunk_hash)
-        comp = _compress(raw)
-        payload = struct.pack(CHUNK_HDR_FMT, ci, chunk_hash, len(comp)) + comp
+        if use_compress:
+            data = _compress(raw)
+            flags = FLAG_COMPRESSED
+        else:
+            data = raw
+            flags = FLAG_RAW
+        payload = struct.pack(CHUNK_HDR_FMT, ci, chunk_hash, len(data), flags) + data
         _send_frame(sock, T_CHUNK, payload)
         if prog:
             prog.advance(len(raw))
@@ -494,17 +518,20 @@ def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
             break
 
 
+import queue as _queue  # noqa: E402  (stdlib)
+
+
 def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     idx      = meta["i"]
     rel_path = meta["p"]
     total    = meta["s"]
     n_chunks = meta["c"]
     mtime    = meta["m"]
+    no_comp  = meta.get("nc", False)   # True = sender sent raw (no zlib)
 
     # Security: block path traversal
     rel = Path(rel_path)
     if rel.is_absolute() or ".." in rel.parts:
-        # drain chunks then NACK
         for _ in range(n_chunks): _read_frame(sock)
         _read_frame(sock)  # FILE_END
         _send_frame(sock, T_FILE_END_ACK,
@@ -519,40 +546,76 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     print(f"  >> {label}  ({_fmt(total).strip()})")
     prog = Progress(rel_path, total)
 
-    # ── receive all chunks, write directly to disk ────────────────────────────
+    # ── async write queue so disk I/O never blocks socket reads ──────────────
+    write_q: _queue.Queue[bytes | None] = _queue.Queue(maxsize=4)
+    write_error: list[Exception] = []
+
+    def _writer() -> None:
+        try:
+            with open(dest, "wb") as fh:
+                while True:
+                    block = write_q.get()
+                    if block is None:   # sentinel
+                        break
+                    fh.write(block)
+        except Exception as e:
+            write_error.append(e)
+
+    writer_thread = threading.Thread(target=_writer, daemon=True, name="ldt-write")
+    writer_thread.start()
+
+    # ── receive all chunks ────────────────────────────────────────────────────
     file_hasher = hashlib.sha256()
     bad_chunks: list[int] = []
 
-    with open(dest, "wb") as fh:
-        for _ in range(n_chunks):
-            t, pl = _read_frame(sock)
-            if t == T_ERROR:
-                print(f"\n  !! sender error mid-transfer", file=sys.stderr)
-                return
+    for _ in range(n_chunks):
+        t, pl = _read_frame(sock)
+        if t == T_ERROR:
+            write_q.put(None)
+            writer_thread.join()
+            print(f"\n  !! sender error mid-transfer", file=sys.stderr)
+            return
 
-            if t != T_CHUNK:
-                bad_chunks.append(-1)
-                continue
+        if t != T_CHUNK:
+            bad_chunks.append(-1)
+            continue
 
-            ci, expected_hash, dlen = struct.unpack_from(CHUNK_HDR_FMT, pl)
-            comp = pl[CHUNK_HDR_SIZE: CHUNK_HDR_SIZE + dlen]
+        ci, expected_hash, dlen, flags = struct.unpack_from(CHUNK_HDR_FMT, pl)
+        raw_data = pl[CHUNK_HDR_SIZE: CHUNK_HDR_SIZE + dlen]
 
+        if flags & FLAG_COMPRESSED:
             try:
-                raw = _decompress(comp)
+                raw = _decompress(raw_data)
             except zlib.error as e:
                 log.warning("Chunk %d decompress error: %s", ci, e)
                 bad_chunks.append(ci)
+                write_q.put(b"\x00" * (CHUNK_SIZE if ci < n_chunks - 1 else total % CHUNK_SIZE or CHUNK_SIZE))
                 continue
+        else:
+            raw = raw_data   # raw passthrough — no decompression needed
 
-            if _sha256(raw) != expected_hash:
-                log.warning("Chunk %d hash mismatch", ci)
-                bad_chunks.append(ci)
-                fh.write(raw)      # write anyway — position must advance
-            else:
-                fh.write(raw)
-                file_hasher.update(raw)
+        if _sha256(raw) != expected_hash:
+            log.warning("Chunk %d hash mismatch", ci)
+            bad_chunks.append(ci)
+            write_q.put(raw)   # write to keep file position correct
+        else:
+            file_hasher.update(raw)
+            write_q.put(raw)
 
-            prog.advance(len(raw))
+        prog.advance(len(raw))
+
+    # Signal writer to finish, wait for all disk writes to complete
+    write_q.put(None)
+    writer_thread.join()
+
+    if write_error:
+        print(f"  !! Write error: {write_error[0]}", file=sys.stderr)
+        dest.unlink(missing_ok=True)
+        # drain FILE_END
+        _read_frame(sock)
+        _send_frame(sock, T_FILE_END_ACK,
+                    json.dumps({"ok": False, "reason": f"write error: {write_error[0]}"}).encode())
+        return
 
     prog.finish()
 
@@ -569,11 +632,9 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     if bad_chunks or actual_hash != sender_hash:
         dest.unlink(missing_ok=True)
         _send_frame(sock, T_FILE_END_ACK, json.dumps({
-            "ok": False,
-            "reason": "hash mismatch",
-            "bad": bad_chunks,
+            "ok": False, "reason": "hash mismatch", "bad": bad_chunks,
         }).encode())
-        print(f"  !! {rel_path}: hash mismatch — will retry", file=sys.stderr)
+        print(f"  !! {rel_path}: hash mismatch -- will retry", file=sys.stderr)
         return
 
     try: os.utime(dest, (mtime, mtime))
