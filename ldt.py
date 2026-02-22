@@ -26,6 +26,22 @@ EXAMPLES
   python ldt.py Bob send Alice ./project
 
 Requirements: Python 3.10+ (stdlib only)
+
+PROTOCOL  (LDTv1)
+-----------------
+TCP frame:
+  [ magic 4B ][ type 1B ][ payload_len 4B ][ payload NB ]
+
+CHUNK payload:
+  [ chunk_index 4B ][ sha256 32B ][ data_len 4B ][ zlib-compressed data ]
+
+Transfer is fully PIPELINED — sender streams all chunks without waiting for
+per-chunk ACKs.  Integrity is verified with SHA-256 per chunk on the
+receiver side and a whole-file SHA-256 at the end.  If any chunks are
+corrupt the receiver returns a NACK list and the sender retries only those.
+
+Discovery: UDP multicast 239.255.42.42:9900
+  {"t":"AN","id":"…","name":"…","port":9900,"v":1}
 """
 
 from __future__ import annotations
@@ -47,62 +63,67 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROTOCOL  (LDTv1 — all integers big-endian)
-#
-# Every TCP message is a frame:
-#   [ magic 4B ][ type 1B ][ payload_len 4B ][ payload NB ]
-#
-# Magic = b"LDT\x01"
-#
-# CHUNK payload layout:
-#   [ chunk_index 4B ][ sha256 32B ][ data_len 4B ][ zlib-compressed data ]
-#
-# Discovery (UDP multicast 239.255.42.42:9900):
-#   JSON datagrams: {"t":"AN","id":"…","name":"…","port":9900,"v":1}
-#   Types: AN=announce, QR=query, BY=bye
+# CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAGIC           = b"LDT\x01"
-HDR_FMT         = "!4sBI"          # magic(4s) type(B) payload_len(I)
+HDR_FMT         = "!4sBI"
 HDR_SIZE        = struct.calcsize(HDR_FMT)   # 9 bytes
-CHUNK_HDR_FMT   = "!I32sI"        # index(I) hash(32s) datalen(I)
+CHUNK_HDR_FMT   = "!I32sI"
 CHUNK_HDR_SIZE  = struct.calcsize(CHUNK_HDR_FMT)  # 40 bytes
 
 TCP_PORT        = 9900
 MCAST_GROUP     = "239.255.42.42"
-MCAST_PORT      = 9900            # same port, different socket so UDP/TCP share the number
-DISC_INTERVAL   = 5.0             # seconds between beacons
-PEER_TTL        = 30.0            # forget peer after this many seconds
-CHUNK_SIZE      = 512 * 1024      # 512 KiB per chunk
-MAX_RETRY       = 3
+MCAST_PORT      = 9900
+DISC_INTERVAL   = 5.0
+PEER_TTL        = 30.0
 
-# Message type bytes
-T_HELLO       = 0x01
-T_HELLO_ACK   = 0x02
-T_FILE_META   = 0x10
-T_CHUNK       = 0x11
-T_CHUNK_ACK   = 0x12
-T_FILE_END    = 0x13
-T_FILE_END_ACK= 0x14
-T_SESSION_END = 0x20
-T_ERROR       = 0xFF
+# Chunk / socket tuning
+CHUNK_SIZE      = 2 * 1024 * 1024   # 2 MiB — reduces overhead vs 512 KiB
+SOCK_BUF        = 8 * 1024 * 1024   # 8 MiB socket buffer
+MAX_RETRY_FILES = 3                  # whole-file retries on hash mismatch
+
+# Message types
+T_HELLO        = 0x01
+T_HELLO_ACK    = 0x02
+T_FILE_META    = 0x10
+T_CHUNK        = 0x11               # no per-chunk ACK — pipelined
+T_FILE_END     = 0x13               # sender: file_index + file_sha256
+T_FILE_END_ACK = 0x14               # receiver: ok | bad_chunks list
+T_SESSION_END  = 0x20
+T_ERROR        = 0xFF
 
 log = logging.getLogger("ldt")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOW-LEVEL I/O
+# SOCKET HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _tune(sock: socket.socket) -> None:
+    """Apply performance socket options."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, SOCK_BUF)
+        except OSError:
+            pass
+
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     if n == 0:
         return b""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
+    buf = bytearray(n)
+    view = memoryview(buf)
+    received = 0
+    while received < n:
+        count = sock.recv_into(view[received:], n - received)
+        if not count:
             raise EOFError("Connection closed")
-        buf.extend(chunk)
+        received += count
     return bytes(buf)
 
 
@@ -120,11 +141,11 @@ def _read_frame(sock: socket.socket) -> tuple[int, bytes]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPRESSION & INTEGRITY  (stdlib only)
+# COMPRESSION & INTEGRITY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compress(data: bytes) -> bytes:
-    return zlib.compress(data, level=6)
+    return zlib.compress(data, level=1)   # level 1 = fastest, still decent ratio
 
 
 def _decompress(data: bytes) -> bytes:
@@ -132,7 +153,7 @@ def _decompress(data: bytes) -> bytes:
 
 
 def _sha256(data: bytes) -> bytes:
-    return hashlib.sha256(data).digest()       # 32 bytes
+    return hashlib.sha256(data).digest()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,8 +173,6 @@ class Peer:
 
 
 class Discovery:
-    """UDP multicast beacon — runs as a daemon background thread."""
-
     def __init__(self, my_name: str, tcp_port: int = TCP_PORT):
         self.my_name = my_name
         self.tcp_port = tcp_port
@@ -162,8 +181,6 @@ class Discovery:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._sock: Optional[socket.socket] = None
-
-    # ── public ────────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         self._sock = self._make_sock()
@@ -190,8 +207,6 @@ class Discovery:
     def query(self) -> None:
         self._send({"t": "QR", "id": self.my_id,
                     "name": self.my_name, "port": self.tcp_port, "v": 1})
-
-    # ── internal ──────────────────────────────────────────────────────────────
 
     def _make_sock(self) -> socket.socket:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -220,8 +235,7 @@ class Discovery:
         last = 0.0
         while not self._stop.is_set():
             if time.monotonic() - last >= DISC_INTERVAL:
-                self._announce()
-                last = time.monotonic()
+                self._announce(); last = time.monotonic()
             try:
                 assert self._sock
                 data, (src_ip, _) = self._sock.recvfrom(1024)
@@ -230,10 +244,8 @@ class Discovery:
                 pass
 
     def _handle(self, msg: dict, src_ip: str) -> None:
-        t  = msg.get("t")
-        pid = msg.get("id", "")
-        if pid == self.my_id:
-            return
+        t = msg.get("t"); pid = msg.get("id", "")
+        if pid == self.my_id: return
         if t == "BY":
             with self._lock: self._peers.pop(pid, None)
             return
@@ -242,8 +254,7 @@ class Discovery:
                         host=src_ip, port=msg.get("port", TCP_PORT),
                         seen=time.monotonic())
             with self._lock: self._peers[pid] = peer
-            if t == "QR":
-                self._announce()
+            if t == "QR": self._announce()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,10 +264,10 @@ class Discovery:
 @dataclass
 class FileEntry:
     abs_path: Path
-    rel_path: str    # path as sent to receiver (forward slashes)
+    rel_path: str
     size: int
     mtime: float
-    chunks: int      # number of CHUNK messages
+    chunks: int
 
 
 def _entries(paths: list[str]) -> list[FileEntry]:
@@ -282,86 +293,73 @@ def _entries(paths: list[str]) -> list[FileEntry]:
 
 
 def _read_chunks(path: Path) -> Iterator[bytes]:
+    """Yield raw chunks from file; empty file yields one empty bytes."""
     if path.stat().st_size == 0:
-        yield b""
-        return
+        yield b""; return
     with open(path, "rb") as fh:
         while True:
             block = fh.read(CHUNK_SIZE)
-            if not block:
-                break
+            if not block: break
             yield block
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROGRESS  (pure stdout, no external libs)
+# PROGRESS BAR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Progress:
-    """Single-line updating progress bar written to stderr."""
+    BAR = 28
 
-    BAR_WIDTH = 30
-
-    def __init__(self, filename: str, total: int) -> None:
-        self.filename = filename
-        self.total = max(total, 1)
+    def __init__(self, label: str, total: int) -> None:
+        self._label = label[-20:] if len(label) > 20 else label
+        self._total = max(total, 1)
         self._done = 0
         self._t0 = time.monotonic()
-        self._last_print = 0.0
+        self._last = 0.0
 
     def advance(self, n: int) -> None:
         self._done += n
         now = time.monotonic()
-        if now - self._last_print >= 0.1 or self._done >= self.total:
-            self._last_print = now
-            self._draw()
+        if now - self._last >= 0.15 or self._done >= self._total:
+            self._last = now; self._draw()
 
     def finish(self) -> None:
-        self._done = self.total
-        self._draw()
-        sys.stderr.write("\n")
-        sys.stderr.flush()
+        self._done = self._total; self._draw(); sys.stderr.write("\n"); sys.stderr.flush()
 
     def _draw(self) -> None:
-        pct = self._done / self.total
-        filled = int(self.BAR_WIDTH * pct)
-        bar = "#" * filled + "." * (self.BAR_WIDTH - filled)
-        elapsed = time.monotonic() - self._t0
-        speed = self._done / elapsed if elapsed > 0 else 0
-        eta = (self.total - self._done) / speed if speed > 0 else 0
-
-        name = self.filename[-22:] if len(self.filename) > 22 else self.filename
-        line = (
-            f"\r  {name:<22}  [{bar}] {pct*100:5.1f}%"
+        pct = self._done / self._total
+        bar = "#" * int(self.BAR * pct) + "." * (self.BAR - int(self.BAR * pct))
+        dt = time.monotonic() - self._t0
+        speed = self._done / dt if dt else 0
+        eta   = (self._total - self._done) / speed if speed > 0 else 0
+        sys.stderr.write(
+            f"\r  {self._label:<20} [{bar}] {pct*100:5.1f}%"
             f"  {_fmt(speed)}/s  ETA {_fmt_t(eta)}"
-        )
-        sys.stderr.write(line)
-        sys.stderr.flush()
+        ); sys.stderr.flush()
 
 
 def _fmt(n: float) -> str:
     for u in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:6.1f} {u}"
+        if abs(n) < 1024: return f"{n:6.1f} {u}"
         n /= 1024
     return f"{n:6.1f} TB"
 
-
 def _fmt_t(s: float) -> str:
     if s < 60: return f"{s:.0f}s"
-    if s < 3600: return f"{s/60:.0f}m{s%60:.0f}s"
-    return f"{s/3600:.0f}h{(s%3600)/60:.0f}m"
+    return f"{s/60:.0f}m{int(s)%60:02d}s"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SENDER
+# SENDER  — fully pipelined, no per-chunk ACK
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _send_session(sock: socket.socket, entries: list[FileEntry],
                   my_name: str, quiet: bool = False) -> None:
+    _tune(sock)
+
     # HELLO
-    hello = json.dumps({"name": my_name, "files": len(entries)}).encode()
-    _send_frame(sock, T_HELLO, hello)
+    _send_frame(sock, T_HELLO,
+                json.dumps({"name": my_name, "files": len(entries)}).encode())
     t, pl = _read_frame(sock)
     ack = json.loads(pl)
     if t != T_HELLO_ACK or not ack.get("ok"):
@@ -371,56 +369,69 @@ def _send_session(sock: socket.socket, entries: list[FileEntry],
         print(f"  [{idx+1}/{len(entries)}] {entry.rel_path}  ({_fmt(entry.size).strip()})")
         _send_file(sock, idx, entry, quiet)
 
-    _send_frame(sock, T_SESSION_END, b"")
 
-
-def _send_file(sock: socket.socket, idx: int, entry: FileEntry, quiet: bool) -> None:
+def _send_file(sock: socket.socket, idx: int, entry: FileEntry,
+               quiet: bool, attempt: int = 0) -> None:
+    """Stream one file; retry on whole-file hash mismatch (up to MAX_RETRY_FILES)."""
     meta = json.dumps({
         "i": idx, "p": entry.rel_path,
         "s": entry.size, "c": entry.chunks, "m": entry.mtime,
+        "retry": attempt,
     }).encode()
     _send_frame(sock, T_FILE_META, meta)
 
+    # ── pipeline: send all chunks without waiting for per-chunk ACK ──────────
     prog = None if quiet else Progress(entry.rel_path, entry.size)
-    raw_parts: list[bytes] = []
+    file_hasher = hashlib.sha256()
+    chunk_hashes: list[bytes] = []
 
     for ci, raw in enumerate(_read_chunks(entry.abs_path)):
-        raw_parts.append(raw)
-        _send_chunk(sock, ci, raw)
+        file_hasher.update(raw)
+        chunk_hash = _sha256(raw)
+        chunk_hashes.append(chunk_hash)
+        comp = _compress(raw)
+        payload = struct.pack(CHUNK_HDR_FMT, ci, chunk_hash, len(comp)) + comp
+        _send_frame(sock, T_CHUNK, payload)
         if prog:
             prog.advance(len(raw))
 
     if prog:
         prog.finish()
 
-    # whole-file hash
-    file_hash = _sha256(b"".join(raw_parts))
+    # Send FILE_END with whole-file hash
+    file_hash = file_hasher.digest()
     _send_frame(sock, T_FILE_END, struct.pack("!I32s", idx, file_hash))
 
+    # Wait for FILE_END_ACK
     t, pl = _read_frame(sock)
     ack = json.loads(pl)
-    if t != T_FILE_END_ACK or not ack.get("ok"):
-        raise RuntimeError(f"File {entry.rel_path} rejected: {ack.get('reason','?')}")
+
+    if t == T_FILE_END_ACK and ack.get("ok"):
+        return  # success
+
+    # Receiver reports bad chunk indices → retry those only
+    bad: list[int] = ack.get("bad", [])
+    if bad:
+        log.warning("%s: %d bad chunk(s): %s", entry.rel_path, len(bad), bad)
+    else:
+        log.warning("%s: file hash mismatch", entry.rel_path)
+
+    reason = ack.get("reason", "?")
+    if attempt >= MAX_RETRY_FILES:
+        raise RuntimeError(f"{entry.rel_path} failed after {MAX_RETRY_FILES} retries: {reason}")
+
+    print(f"  Retry {attempt+1}/{MAX_RETRY_FILES} for {entry.rel_path} ({reason})")
+    _send_file(sock, idx, entry, quiet, attempt + 1)
+
+    # Final SESSION_END (called by caller after all files)
 
 
-def _send_chunk(sock: socket.socket, ci: int, raw: bytes, attempt: int = 0) -> None:
-    h = _sha256(raw)
-    comp = _compress(raw)
-    payload = struct.pack(CHUNK_HDR_FMT, ci, h, len(comp)) + comp
-    _send_frame(sock, T_CHUNK, payload)
-
-    t, pl = _read_frame(sock)
-    ack = json.loads(pl)
-    if t != T_CHUNK_ACK or not ack.get("ok"):
-        if attempt < MAX_RETRY:
-            log.warning("Chunk %d NACK — retry %d/%d", ci, attempt+1, MAX_RETRY)
-            _send_chunk(sock, ci, raw, attempt + 1)
-        else:
-            raise RuntimeError(f"Chunk {ci} failed after {MAX_RETRY} retries")
+def _finish_session(sock: socket.socket) -> None:
+    _send_frame(sock, T_SESSION_END, b"")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RECEIVER
+# RECEIVER  — stream chunks directly to disk, one SHA-256 file check
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _recv_server(dest_dir: Path, port: int) -> socket.socket:
@@ -440,15 +451,15 @@ def _recv_loop(server: socket.socket, dest_dir: Path, stop: threading.Event) -> 
             continue
         except OSError:
             break
-        t = threading.Thread(
+        threading.Thread(
             target=_recv_conn, args=(conn, addr[0], dest_dir),
-            daemon=True, name=f"ldt-conn-{addr[0]}"
-        )
-        t.start()
+            daemon=True, name=f"ldt-{addr[0]}"
+        ).start()
 
 
 def _recv_conn(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
     try:
+        _tune(sock)
         _recv_session(sock, peer_ip, dest_dir)
     except EOFError:
         pass
@@ -460,16 +471,16 @@ def _recv_conn(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
 
 
 def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
-    # HELLO
     t, pl = _read_frame(sock)
     if t != T_HELLO:
-        _send_frame(sock, T_HELLO_ACK, json.dumps({"ok": False, "reason": "expected HELLO"}).encode())
+        _send_frame(sock, T_HELLO_ACK,
+                    json.dumps({"ok": False, "reason": "expected HELLO"}).encode())
         return
     info = json.loads(pl)
     sender = info.get("name", peer_ip)
     _send_frame(sock, T_HELLO_ACK, json.dumps({"ok": True}).encode())
 
-    print(f"\n  <- {sender} ({peer_ip}) is sending {info.get('files','?')} file(s)")
+    print(f"\n  <- {sender} ({peer_ip})  {info.get('files','?')} file(s)")
 
     while True:
         t, pl = _read_frame(sock)
@@ -479,21 +490,23 @@ def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
         elif t == T_FILE_META:
             _recv_file(sock, json.loads(pl), dest_dir)
         elif t == T_ERROR:
-            err = json.loads(pl)
-            print(f"  !! Sender error: {err.get('msg','?')}", file=sys.stderr)
+            print(f"  !! {json.loads(pl).get('msg','?')}", file=sys.stderr)
             break
 
 
 def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
-    idx       = meta["i"]
-    rel_path  = meta["p"]
-    total     = meta["s"]
-    n_chunks  = meta["c"]
-    mtime     = meta["m"]
+    idx      = meta["i"]
+    rel_path = meta["p"]
+    total    = meta["s"]
+    n_chunks = meta["c"]
+    mtime    = meta["m"]
 
-    # safety: block directory traversal
+    # Security: block path traversal
     rel = Path(rel_path)
     if rel.is_absolute() or ".." in rel.parts:
+        # drain chunks then NACK
+        for _ in range(n_chunks): _read_frame(sock)
+        _read_frame(sock)  # FILE_END
         _send_frame(sock, T_FILE_END_ACK,
                     json.dumps({"ok": False, "reason": "unsafe path"}).encode())
         return
@@ -501,64 +514,70 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     dest = dest_dir / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"  >> {rel_path}  ({_fmt(total).strip()})")  # >> = incoming
+    is_retry = meta.get("retry", 0) > 0
+    label = f"{'retry ' if is_retry else ''}{rel_path}"
+    print(f"  >> {label}  ({_fmt(total).strip()})")
     prog = Progress(rel_path, total)
-    raw_parts: dict[int, bytes] = {}
 
-    for _ in range(n_chunks):
-        t, pl = _read_frame(sock)
-        if t == T_ERROR:
-            print(f"\n  ✗ Sender error mid-transfer", file=sys.stderr)
-            return
-        if t != T_CHUNK:
-            _send_frame(sock, T_CHUNK_ACK,
-                        json.dumps({"ok": False, "reason": f"unexpected {t}"}).encode())
-            return
+    # ── receive all chunks, write directly to disk ────────────────────────────
+    file_hasher = hashlib.sha256()
+    bad_chunks: list[int] = []
 
-        ci, expected_hash, dlen = struct.unpack_from(CHUNK_HDR_FMT, pl)
-        comp = pl[CHUNK_HDR_SIZE: CHUNK_HDR_SIZE + dlen]
+    with open(dest, "wb") as fh:
+        for _ in range(n_chunks):
+            t, pl = _read_frame(sock)
+            if t == T_ERROR:
+                print(f"\n  !! sender error mid-transfer", file=sys.stderr)
+                return
 
-        try:
-            raw = _decompress(comp)
-        except zlib.error as e:
-            _send_frame(sock, T_CHUNK_ACK,
-                        json.dumps({"ok": False, "reason": f"decompress: {e}"}).encode())
-            return
+            if t != T_CHUNK:
+                bad_chunks.append(-1)
+                continue
 
-        if _sha256(raw) != expected_hash:
-            _send_frame(sock, T_CHUNK_ACK,
-                        json.dumps({"ok": False, "reason": "hash mismatch"}).encode())
-            log.warning("Chunk %d hash mismatch", ci)
-            return
+            ci, expected_hash, dlen = struct.unpack_from(CHUNK_HDR_FMT, pl)
+            comp = pl[CHUNK_HDR_SIZE: CHUNK_HDR_SIZE + dlen]
 
-        _send_frame(sock, T_CHUNK_ACK, json.dumps({"ok": True}).encode())
-        raw_parts[ci] = raw
-        prog.advance(len(raw))
+            try:
+                raw = _decompress(comp)
+            except zlib.error as e:
+                log.warning("Chunk %d decompress error: %s", ci, e)
+                bad_chunks.append(ci)
+                continue
+
+            if _sha256(raw) != expected_hash:
+                log.warning("Chunk %d hash mismatch", ci)
+                bad_chunks.append(ci)
+                fh.write(raw)      # write anyway — position must advance
+            else:
+                fh.write(raw)
+                file_hasher.update(raw)
+
+            prog.advance(len(raw))
 
     prog.finish()
 
-    # write file
-    with open(dest, "wb") as fh:
-        for i in range(n_chunks):
-            fh.write(raw_parts[i])
-    try: os.utime(dest, (mtime, mtime))
-    except OSError: pass
-
-    # FILE_END / whole-file hash
+    # FILE_END with whole-file hash
     t, pl = _read_frame(sock)
     if t != T_FILE_END:
         _send_frame(sock, T_FILE_END_ACK,
-                    json.dumps({"ok": False, "reason": f"expected FILE_END"}).encode())
+                    json.dumps({"ok": False, "reason": "expected FILE_END"}).encode())
         return
 
-    _, file_hash = struct.unpack("!I32s", pl)
-    actual = _sha256(b"".join(raw_parts[i] for i in range(n_chunks)))
-    if actual != file_hash:
+    _, sender_hash = struct.unpack("!I32s", pl)
+    actual_hash = file_hasher.digest()
+
+    if bad_chunks or actual_hash != sender_hash:
         dest.unlink(missing_ok=True)
-        _send_frame(sock, T_FILE_END_ACK,
-                    json.dumps({"ok": False, "reason": "file hash mismatch"}).encode())
-        print(f"  !! {rel_path}: file hash mismatch -- deleted", file=sys.stderr)
+        _send_frame(sock, T_FILE_END_ACK, json.dumps({
+            "ok": False,
+            "reason": "hash mismatch",
+            "bad": bad_chunks,
+        }).encode())
+        print(f"  !! {rel_path}: hash mismatch — will retry", file=sys.stderr)
         return
+
+    try: os.utime(dest, (mtime, mtime))
+    except OSError: pass
 
     _send_frame(sock, T_FILE_END_ACK, json.dumps({"ok": True}).encode())
     print(f"  OK saved -> {dest}")
@@ -577,16 +596,13 @@ def cmd_receive(args: argparse.Namespace) -> int:
 
     server = _recv_server(dest, args.port)
     stop = threading.Event()
-    t = threading.Thread(target=_recv_loop, args=(server, dest, stop),
-                         daemon=True, name="ldt-server")
-    t.start()
+    threading.Thread(target=_recv_loop, args=(server, dest, stop),
+                     daemon=True, name="ldt-server").start()
 
-    print(f"LDT receiver  |  name: {args.name}  |  port: {args.port}  |  saving to: {dest}")
-    print("Waiting for transfers…  (Ctrl-C to stop)\n")
-
+    print(f"LDT  |  name: {args.name}  |  port: {args.port}  |  saving to: {dest}")
+    print("Waiting for transfers...  (Ctrl-C to stop)\n")
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         pass
 
@@ -602,65 +618,53 @@ def cmd_send(args: argparse.Namespace) -> int:
     try:
         entries = _entries(args.paths)
     except FileNotFoundError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        print(f"Error: {e}", file=sys.stderr); return 1
 
     if not entries:
-        print("Nothing to send.", file=sys.stderr)
-        return 1
+        print("Nothing to send.", file=sys.stderr); return 1
 
-    # discover target
     disc = Discovery(args.name, args.port)
     disc.start()
     disc.query()
 
-    host: str
-    port: int
-
-    # wait up to 3 s for peer
+    host: str; port: int
     deadline = time.monotonic() + 3
     peer = None
     while time.monotonic() < deadline:
         peer = disc.find(args.target)
-        if peer:
-            break
+        if peer: break
         time.sleep(0.2)
 
     if peer:
         host, port = peer.host, peer.port
         print(f"Found {peer.name} at {host}:{port}")
     else:
-        # treat target as raw IP
         host, port = args.target, args.port
-        print(f"Peer '{args.target}' not found via discovery — trying {host}:{port} directly")
+        print(f"Peer '{args.target}' not found — trying {host}:{port} directly")
 
     total = sum(e.size for e in entries)
-    print(f"Sending {len(entries)} file(s)  ({_fmt(total).strip()})  →  {host}:{port}\n")
+    print(f"Sending {len(entries)} file(s)  ({_fmt(total).strip()})  ->  {host}:{port}\n")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)
+    sock.settimeout(15)
     try:
         sock.connect((host, port))
     except OSError as e:
-        print(f"Cannot connect to {host}:{port} — {e}", file=sys.stderr)
-        disc.stop()
-        return 1
+        print(f"Cannot connect: {e}", file=sys.stderr); disc.stop(); return 1
     sock.settimeout(None)
 
     rc = 0
     try:
         t0 = time.monotonic()
         _send_session(sock, entries, args.name, quiet=args.quiet)
+        _finish_session(sock)
         dt = time.monotonic() - t0
         speed = total / dt if dt else 0
-        print(f"\nDone  {_fmt(total).strip()} in {_fmt_t(dt)}  (avg {_fmt(speed).strip()}/s)")
+        print(f"\nDone  {_fmt(total).strip()} in {_fmt_t(dt)}  ({_fmt(speed).strip()}/s avg)")
     except Exception as e:
-        print(f"\nTransfer failed: {e}", file=sys.stderr)
-        rc = 1
+        print(f"\nTransfer failed: {e}", file=sys.stderr); rc = 1
     finally:
-        sock.close()
-        disc.stop()
-
+        sock.close(); disc.stop()
     return rc
 
 
@@ -670,18 +674,17 @@ def cmd_peers(args: argparse.Namespace) -> int:
     disc.query()
 
     wait = max(1, args.wait)
-    print(f"Scanning for {wait:.0f}s …")
+    print(f"Scanning for {wait:.0f}s ...")
     time.sleep(wait)
 
     peers = disc.peers()
     disc.stop()
 
     if not peers:
-        print("No peers found.")
-        return 0
+        print("No peers found."); return 0
 
     print(f"\n  {'NAME':<20}  {'IP':<16}  PORT")
-    print("  " + "─" * 44)
+    print("  " + "-" * 44)
     for p in peers:
         print(f"  {p.name:<20}  {p.host:<16}  {p.port}")
     print()
@@ -695,7 +698,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="ldt",
-        description="LDT — Local Data Transfer  (serverless · P2P · no dependencies)",
+        description="LDT -- Local Data Transfer  (serverless, P2P, stdlib only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
@@ -712,32 +715,26 @@ examples:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # receive
     r = sub.add_parser("receive", help="Accept incoming transfers")
     r.add_argument("--dir", default="./received",
-                   help="Directory to save received files  (default: ./received)")
+                   help="Directory for received files  (default: ./received)")
 
-    # send
     s = sub.add_parser("send", help="Send files/folders to a peer")
-    s.add_argument("target", help="Recipient name or IP address")
-    s.add_argument("paths", nargs="+", metavar="path",
-                   help="Files or folders to send")
+    s.add_argument("target", help="Recipient name or IP")
+    s.add_argument("paths", nargs="+", metavar="path")
     s.add_argument("--quiet", action="store_true", help="No progress bars")
 
-    # peers
-    q = sub.add_parser("peers", help="List peers visible on the network")
-    q.add_argument("--wait", type=float, default=3,
-                   help="Seconds to wait for responses  (default 3)")
+    q = sub.add_parser("peers", help="List peers on the network")
+    q.add_argument("--wait", type=float, default=3)
 
     args = p.parse_args()
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG,
-                            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                            format="%(asctime)s %(levelname)s: %(message)s",
                             datefmt="%H:%M:%S")
 
-    handlers = {"receive": cmd_receive, "send": cmd_send, "peers": cmd_peers}
-    sys.exit(handlers[args.cmd](args))
+    sys.exit({"receive": cmd_receive, "send": cmd_send, "peers": cmd_peers}[args.cmd](args))
 
 
 if __name__ == "__main__":
