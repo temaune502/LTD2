@@ -1,2 +1,0 @@
-# No external dependencies — stdlib only (Python 3.10+)
-# zlib, hashlib, socket, struct, threading, json — all built-in

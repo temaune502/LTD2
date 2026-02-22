@@ -297,6 +297,9 @@ def _entries(paths: list[str]) -> list[FileEntry]:
     return result
 
 
+import queue as _diskq
+
+
 def _read_chunks(path: Path) -> Iterator[bytes]:
     """Yield raw chunks from file; empty file yields one empty bytes."""
     if path.stat().st_size == 0:
@@ -306,6 +309,26 @@ def _read_chunks(path: Path) -> Iterator[bytes]:
             block = fh.read(CHUNK_SIZE)
             if not block: break
             yield block
+
+
+def _read_chunks_async(path: Path) -> Iterator[bytes]:
+    """Same as _read_chunks but pre-fetches the next chunk in a background
+    thread, overlapping disk I/O with network transmission."""
+    q: _diskq.Queue[bytes | None] = _diskq.Queue(maxsize=2)
+
+    def _reader() -> None:
+        try:
+            for chunk in _read_chunks(path):
+                q.put(chunk)
+        finally:
+            q.put(None)  # sentinel
+
+    threading.Thread(target=_reader, daemon=True, name="ldt-disk").start()
+    while True:
+        chunk = q.get()
+        if chunk is None:
+            break
+        yield chunk
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,7 +428,7 @@ def _send_file(sock: socket.socket, idx: int, entry: FileEntry,
     prog = None if quiet else Progress(entry.rel_path, entry.size)
     file_hasher = hashlib.sha256()
 
-    for ci, raw in enumerate(_read_chunks(entry.abs_path)):
+    for ci, raw in enumerate(_read_chunks_async(entry.abs_path)):
         file_hasher.update(raw)
         chunk_hash = _sha256(raw)
         if use_compress:
@@ -452,6 +475,57 @@ def _send_file(sock: socket.socket, idx: int, entry: FileEntry,
 
 def _finish_session(sock: socket.socket) -> None:
     _send_frame(sock, T_SESSION_END, b"")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARALLEL SEND  — split file list across N TCP connections
+# ─────────────────────────────────────────────────────────────────────────────
+
+_print_lock = threading.Lock()
+
+
+def _send_parallel(
+    entries: list[FileEntry], host: str, port: int,
+    my_name: str, workers: int, quiet: bool,
+) -> None:
+    """Send files across `workers` simultaneous TCP connections.
+    Each connection carries a round-robin slice of the file list.
+    Receiver already handles multiple concurrent connections.
+    """
+    workers = min(workers, len(entries))
+    groups: list[list[FileEntry]] = [[] for _ in range(workers)]
+    for i, e in enumerate(entries):
+        groups[i % workers].append(e)
+
+    errors: list[Exception] = []
+    err_lock = threading.Lock()
+
+    def _worker(group: list[FileEntry], wid: int) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        try:
+            sock.connect((host, port))
+        except OSError as e:
+            with err_lock: errors.append(e)
+            return
+        sock.settimeout(None)
+        try:
+            _send_session(sock, group, my_name, quiet)
+            _finish_session(sock)
+        except Exception as e:
+            with err_lock: errors.append(e)
+        finally:
+            sock.close()
+
+    threads = [
+        threading.Thread(target=_worker, args=(g, i), name=f"ldt-send-{i}", daemon=True)
+        for i, g in enumerate(groups) if g
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    if errors:
+        raise errors[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -704,28 +778,38 @@ def cmd_send(args: argparse.Namespace) -> int:
         print(f"Peer '{args.target}' not found — trying {host}:{port} directly")
 
     total = sum(e.size for e in entries)
-    print(f"Sending {len(entries)} file(s)  ({_fmt(total).strip()})  ->  {host}:{port}\n")
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(15)
-    try:
-        sock.connect((host, port))
-    except OSError as e:
-        print(f"Cannot connect: {e}", file=sys.stderr); disc.stop(); return 1
-    sock.settimeout(None)
+    workers = min(args.workers, len(entries))
+    if workers <= 1:
+        workers = 1
+    print(f"Sending {len(entries)} file(s)  ({_fmt(total).strip()})  ->  {host}:{port}"
+          + (f"  [workers={workers}]" if workers > 1 else "") + "\n")
 
     rc = 0
     try:
         t0 = time.monotonic()
-        _send_session(sock, entries, args.name, quiet=args.quiet)
-        _finish_session(sock)
+        if workers <= 1:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            try:
+                sock.connect((host, port))
+            except OSError as e:
+                print(f"Cannot connect: {e}", file=sys.stderr)
+                disc.stop(); return 1
+            sock.settimeout(None)
+            try:
+                _send_session(sock, entries, args.name, quiet=args.quiet)
+                _finish_session(sock)
+            finally:
+                sock.close()
+        else:
+            _send_parallel(entries, host, port, args.name, workers, args.quiet)
         dt = time.monotonic() - t0
         speed = total / dt if dt else 0
         print(f"\nDone  {_fmt(total).strip()} in {_fmt_t(dt)}  ({_fmt(speed).strip()}/s avg)")
     except Exception as e:
         print(f"\nTransfer failed: {e}", file=sys.stderr); rc = 1
     finally:
-        sock.close(); disc.stop()
+        disc.stop()
     return rc
 
 
@@ -784,6 +868,10 @@ examples:
     s.add_argument("target", help="Recipient name or IP")
     s.add_argument("paths", nargs="+", metavar="path")
     s.add_argument("--quiet", action="store_true", help="No progress bars")
+    s.add_argument(
+        "--workers", type=int, default=1, metavar="N",
+        help="Parallel TCP connections (default 1; try 3-4 for folders on WiFi)",
+    )
 
     q = sub.add_parser("peers", help="List peers on the network")
     q.add_argument("--wait", type=float, default=3)
