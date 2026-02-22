@@ -383,8 +383,11 @@ def _fmt_t(s: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _send_session(sock: socket.socket, entries: list[FileEntry],
-                  my_name: str, quiet: bool = False) -> None:
+                  my_name: str, quiet: bool = False,
+                  g_offset: int = 0, g_total: int = 0) -> None:
+    """g_offset / g_total: global file numbering for parallel workers."""
     _tune(sock)
+    total_label = g_total or len(entries)
 
     # HELLO
     _send_frame(sock, T_HELLO,
@@ -395,7 +398,8 @@ def _send_session(sock: socket.socket, entries: list[FileEntry],
         raise RuntimeError(f"Rejected: {ack.get('reason', '?')}")
 
     for idx, entry in enumerate(entries):
-        print(f"  [{idx+1}/{len(entries)}] {entry.rel_path}  ({_fmt(entry.size).strip()})")
+        global_idx = g_offset + idx + 1
+        print(f"  [{global_idx}/{total_label}] {entry.rel_path}  ({_fmt(entry.size).strip()})")
         _send_file(sock, idx, entry, quiet)
 
 
@@ -501,7 +505,19 @@ def _send_parallel(
     errors: list[Exception] = []
     err_lock = threading.Lock()
 
-    def _worker(group: list[FileEntry], wid: int) -> None:
+    # Compute per-worker global offset (round-robin distribution)
+    # group i contains entries at indices i, i+workers, i+2*workers, ...
+    # so offset for group i = i  (since round-robin: groups[i%workers].append(e))
+    g_total = len(entries)
+    g_offsets = [0] * workers
+    count = 0
+    for i in range(workers):
+        g_offsets[i] = count
+        # files assigned to worker i: ceil((g_total - i) / workers)
+        assigned = len(groups[i])
+        count += assigned
+
+    def _worker(group: list[FileEntry], wid: int, g_off: int) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(15)
         try:
@@ -511,7 +527,8 @@ def _send_parallel(
             return
         sock.settimeout(None)
         try:
-            _send_session(sock, group, my_name, quiet)
+            _send_session(sock, group, my_name, quiet,
+                          g_offset=g_off, g_total=g_total)
             _finish_session(sock)
         except Exception as e:
             with err_lock: errors.append(e)
@@ -519,7 +536,8 @@ def _send_parallel(
             sock.close()
 
     threads = [
-        threading.Thread(target=_worker, args=(g, i), name=f"ldt-send-{i}", daemon=True)
+        threading.Thread(target=_worker, args=(g, i, g_offsets[i]),
+                         name=f"ldt-send-{i}", daemon=True)
         for i, g in enumerate(groups) if g
     ]
     for t in threads: t.start()
