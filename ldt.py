@@ -51,6 +51,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import socket
 import struct
 import sys
@@ -837,6 +838,194 @@ def cmd_peers(args: argparse.Namespace) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE (REPL) MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REPL_HELP = """
+Commands:
+  peers                            List peers on the network
+  send <target> <path> [<path>...]  Send files/folders to a peer
+       --workers N                 Use N parallel connections (default 1)
+  dir [PATH]                       Change/show save directory for received files
+  help                             Show this message
+  exit                             Quit
+"""
+
+
+def _do_send_interactive(
+    disc: Discovery, line_parts: list[str],
+    my_name: str, port: int, quiet: bool,
+) -> None:
+    """Parse and execute a `send` command entered at the interactive prompt."""
+    # Parse workers flag
+    workers = 1
+    clean: list[str] = []
+    i = 0
+    while i < len(line_parts):
+        if line_parts[i] == "--workers" and i + 1 < len(line_parts):
+            try: workers = int(line_parts[i + 1])
+            except ValueError: pass
+            i += 2
+        else:
+            clean.append(line_parts[i]); i += 1
+
+    if len(clean) < 2:
+        print("  Usage: send <target> <path> [<path>...]")
+        return
+
+    target, raw_paths = clean[0], clean[1:]
+
+    try:
+        entries = _entries(raw_paths)
+    except FileNotFoundError as e:
+        print(f"  Error: {e}"); return
+
+    if not entries:
+        print("  Nothing to send."); return
+
+    # Resolve peer
+    disc.query()
+    deadline = time.monotonic() + 3
+    peer = None
+    while time.monotonic() < deadline:
+        peer = disc.find(target)
+        if peer: break
+        time.sleep(0.2)
+
+    if peer:
+        host, p_port = peer.host, peer.port
+        print(f"  -> {peer.name}  [{host}:{p_port}]")
+    else:
+        host, p_port = target, port
+        print(f"  Peer '{target}' not found — trying {host}:{p_port} directly")
+
+    total = sum(e.size for e in entries)
+    workers = min(workers, len(entries))
+    print(f"  Sending {len(entries)} file(s)  ({_fmt(total).strip()})" +
+          (f"  [workers={workers}]" if workers > 1 else "") + "\n")
+
+    try:
+        t0 = time.monotonic()
+        if workers <= 1:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            sock.connect((host, p_port))
+            sock.settimeout(None)
+            try:
+                _send_session(sock, entries, my_name, quiet)
+                _finish_session(sock)
+            finally:
+                sock.close()
+        else:
+            _send_parallel(entries, host, p_port, my_name, workers, quiet)
+        dt = time.monotonic() - t0
+        speed = total / dt if dt else 0
+        print(f"\n  Done  {_fmt(total).strip()} in {_fmt_t(dt)}  ({_fmt(speed).strip()}/s)")
+    except OSError as e:
+        print(f"  Cannot connect: {e}")
+    except Exception as e:
+        print(f"  Transfer failed: {e}")
+
+
+def cmd_interactive(args: argparse.Namespace) -> int:
+    """Default mode: receiver always on, interactive send/peers commands."""
+    recv_dir = Path(getattr(args, "dir", "./received")).resolve()
+    recv_dir.mkdir(parents=True, exist_ok=True)
+
+    disc = Discovery(args.name, args.port)
+    disc.start()
+
+    server = _recv_server(recv_dir, args.port)
+    stop = threading.Event()
+    threading.Thread(target=_recv_loop, args=(server, recv_dir, stop),
+                     daemon=True, name="ldt-server").start()
+
+    print(f"LDT  |  {args.name}  |  port {args.port}  |  saving to {recv_dir}")
+    print("Ready. Type 'help' for commands, Ctrl-C to exit.\n")
+
+    quiet = False
+
+    try:
+        while True:
+            try:
+                line = input("ldt> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if not line:
+                continue
+
+            try:
+                parts = shlex.split(line)
+            except ValueError as e:
+                print(f"  Parse error: {e}"); continue
+
+            cmd = parts[0].lower()
+            rest = parts[1:]
+
+            if cmd in ("exit", "quit", "q"):
+                break
+
+            elif cmd in ("help", "h", "?"):
+                print(_REPL_HELP)
+
+            elif cmd == "peers":
+                disc.query()
+                time.sleep(0.8)
+                found = disc.peers()
+                if not found:
+                    print("  No peers found yet — peers announce every 5s")
+                else:
+                    print(f"\n  {'NAME':<20}  {'IP':<16}  PORT")
+                    print("  " + "-" * 44)
+                    for peer in found:
+                        print(f"  {peer.name:<20}  {peer.host:<16}  {peer.port}")
+                    print()
+
+            elif cmd == "send":
+                _do_send_interactive(disc, rest, args.name, args.port, quiet)
+
+            elif cmd == "dir":
+                if rest:
+                    try:
+                        new_dir = Path(rest[0]).resolve()
+                        new_dir.mkdir(parents=True, exist_ok=True)
+                        recv_dir = new_dir
+                        # Restart server with new dest
+                        stop.set()
+                        try: server.close()
+                        except OSError: pass
+                        stop = threading.Event()
+                        server = _recv_server(recv_dir, args.port)
+                        threading.Thread(
+                            target=_recv_loop, args=(server, recv_dir, stop),
+                            daemon=True, name="ldt-server"
+                        ).start()
+                        print(f"  Saving to: {recv_dir}")
+                    except Exception as e:
+                        print(f"  Error: {e}")
+                else:
+                    print(f"  Saving to: {recv_dir}")
+
+            elif cmd == "quiet":
+                quiet = not quiet
+                print(f"  Quiet mode: {'on' if quiet else 'off'}")
+
+            else:
+                print(f"  Unknown command: '{cmd}'  (type 'help')")
+
+    except KeyboardInterrupt:
+        pass
+
+    stop.set()
+    try: server.close()
+    except OSError: pass
+    disc.stop()
+    print("\nBye.")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -847,24 +1036,25 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python ldt.py Alice receive
-  python ldt.py Bob   peers
-  python ldt.py Bob   send Alice report.pdf
-  python ldt.py Bob   send Alice ./project_folder
+  python ldt.py Alice               <- interactive mode (recommended)
+  python ldt.py Alice receive       <- receive-only mode
+  python ldt.py Bob send Alice report.pdf
 """,
     )
     p.add_argument("name", help="Your display name on the network")
     p.add_argument("--port", type=int, default=TCP_PORT,
                    help=f"UDP/TCP port (default {TCP_PORT})")
+    p.add_argument("--dir", default="./received",
+                   help="Directory for received files (default: ./received)")
     p.add_argument("-v", "--verbose", action="store_true")
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd", required=False)
 
-    r = sub.add_parser("receive", help="Accept incoming transfers")
+    r = sub.add_parser("receive", help="Receive-only mode (no interactive prompt)")
     r.add_argument("--dir", default="./received",
                    help="Directory for received files  (default: ./received)")
 
-    s = sub.add_parser("send", help="Send files/folders to a peer")
+    s = sub.add_parser("send", help="Send files/folders to a peer (one-shot)")
     s.add_argument("target", help="Recipient name or IP")
     s.add_argument("paths", nargs="+", metavar="path")
     s.add_argument("--quiet", action="store_true", help="No progress bars")
@@ -873,7 +1063,7 @@ examples:
         help="Parallel TCP connections (default 1; try 3-4 for folders on WiFi)",
     )
 
-    q = sub.add_parser("peers", help="List peers on the network")
+    q = sub.add_parser("peers", help="List peers on the network (one-shot)")
     q.add_argument("--wait", type=float, default=3)
 
     args = p.parse_args()
@@ -883,7 +1073,13 @@ examples:
                             format="%(asctime)s %(levelname)s: %(message)s",
                             datefmt="%H:%M:%S")
 
-    sys.exit({"receive": cmd_receive, "send": cmd_send, "peers": cmd_peers}[args.cmd](args))
+    dispatch = {
+        "receive": cmd_receive,
+        "send":    cmd_send,
+        "peers":   cmd_peers,
+    }
+    fn = dispatch.get(args.cmd or "", cmd_interactive)
+    sys.exit(fn(args))
 
 
 if __name__ == "__main__":
