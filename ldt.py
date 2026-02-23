@@ -97,7 +97,10 @@ T_CHUNK        = 0x11               # no per-chunk ACK — pipelined
 T_FILE_END     = 0x13               # sender: file_index + file_sha256
 T_FILE_END_ACK = 0x14               # receiver: ok | bad_chunks list
 T_SESSION_END  = 0x20
+T_CANCEL       = 0x21               # either side: abort current transfer cleanly
 T_ERROR        = 0xFF
+
+RESUME_DIR     = ".ldt_resume"      # folder inside dest_dir for manifests
 
 log = logging.getLogger("ldt")
 
@@ -382,75 +385,173 @@ def _fmt_t(s: float) -> str:
 # SENDER  — fully pipelined, no per-chunk ACK
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _send_session(sock: socket.socket, entries: list[FileEntry],
-                  my_name: str, quiet: bool = False,
-                  g_offset: int = 0, g_total: int = 0) -> None:
-    """g_offset / g_total: global file numbering for parallel workers."""
+# ─────────────────────────────────────────────────────────────────────────────
+# RESUME HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resume_manifest_path(dest_dir: Path) -> Path:
+    return dest_dir / RESUME_DIR / "manifest.json"
+
+
+def _load_manifest(dest_dir: Path) -> dict:
+    p = _resume_manifest_path(dest_dir)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_manifest(dest_dir: Path, manifest: dict) -> None:
+    p = _resume_manifest_path(dest_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _check_receiver_state(
+    entries: list[FileEntry], dest_dir: Path
+) -> tuple[list[int], dict[int, int]]:
+    """Check dest_dir for completed / partial files.
+    Returns (skip_indices, resume_map) where resume_map maps idx→chunk_count.
+    """
+    manifest = _load_manifest(dest_dir)
+    skip: list[int] = []
+    resume: dict[int, int] = {}
+
+    for idx, entry in enumerate(entries):
+        dest = dest_dir / Path(entry.rel_path)
+        part = dest.with_suffix(dest.suffix + ".ldtpart")
+
+        if dest.exists() and dest.stat().st_size == entry.size:
+            skip.append(idx)
+        elif entry.rel_path in manifest:
+            n_chunks = manifest[entry.rel_path].get("chunks", 0)
+            if n_chunks > 0 and part.exists():
+                resume[idx] = n_chunks
+
+    return skip, resume
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SENDER  — fully pipelined, no per-chunk ACK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _send_session(
+    sock: socket.socket, entries: list[FileEntry],
+    my_name: str, quiet: bool = False,
+    g_offset: int = 0, g_total: int = 0,
+    cancel: threading.Event | None = None,
+) -> None:
+    """g_offset / g_total: global file numbering for parallel workers.
+    cancel: set this Event to abort cleanly with T_CANCEL.
+    """
     _tune(sock)
     total_label = g_total or len(entries)
 
-    # HELLO
+    # HELLO — include lightweight manifest for resume negotiation
+    manifest_payload = [{"p": e.rel_path, "s": e.size, "m": e.mtime}
+                        for e in entries]
     _send_frame(sock, T_HELLO,
-                json.dumps({"name": my_name, "files": len(entries)}).encode())
+                json.dumps({"name": my_name, "files": len(entries),
+                            "manifest": manifest_payload}).encode())
     t, pl = _read_frame(sock)
     ack = json.loads(pl)
     if t != T_HELLO_ACK or not ack.get("ok"):
         raise RuntimeError(f"Rejected: {ack.get('reason', '?')}")
 
+    skip_set: set[int] = set(ack.get("skip", []))
+    resume_map: dict[int, int] = {int(k): v for k, v in ack.get("resume", {}).items()}
+
     for idx, entry in enumerate(entries):
         global_idx = g_offset + idx + 1
-        print(f"  [{global_idx}/{total_label}] {entry.rel_path}  ({_fmt(entry.size).strip()})")
-        _send_file(sock, idx, entry, quiet)
+
+        if cancel and cancel.is_set():
+            _send_frame(sock, T_CANCEL, b"")
+            return
+
+        if idx in skip_set:
+            print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
+                  f"({_fmt(entry.size).strip()})  -- SKIP (already on receiver)")
+            continue
+
+        resume_from = resume_map.get(idx, 0)
+        if resume_from:
+            print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
+                  f"({_fmt(entry.size).strip()})  -- RESUME from chunk {resume_from}")
+        else:
+            print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
+                  f"({_fmt(entry.size).strip()})")
+
+        _send_file(sock, idx, entry, quiet, attempt=0,
+                   resume_from=resume_from, cancel=cancel)
 
 
-def _send_file(sock: socket.socket, idx: int, entry: FileEntry,
-               quiet: bool, attempt: int = 0) -> None:
+def _send_file(
+    sock: socket.socket, idx: int, entry: FileEntry,
+    quiet: bool, attempt: int = 0,
+    resume_from: int = 0,
+    cancel: threading.Event | None = None,
+) -> None:
     """Stream one file; retry on whole-file hash mismatch (up to MAX_RETRY_FILES)."""
 
     # ── decide whether to compress this file ─────────────────────────────────
-    # Probe the first CHUNK_SIZE bytes. If zlib saves < COMPRESS_MIN_GAIN,
-    # skip compression entirely — big win for video/zip/jpg/etc.
     use_compress = True
     if entry.size > 0:
         probe_size = min(entry.size, CHUNK_SIZE)
         with open(entry.abs_path, "rb") as fh:
+            fh.seek(resume_from * CHUNK_SIZE)  # probe from current position
             probe = fh.read(probe_size)
-        probe_comp = _compress(probe)
-        ratio = 1.0 - len(probe_comp) / len(probe)
-        use_compress = ratio >= COMPRESS_MIN_GAIN
-        if not use_compress:
-            log.debug("%s: skipping compression (ratio %.1f%%)", entry.rel_path, ratio * 100)
+        if probe:
+            probe_comp = _compress(probe)
+            ratio = 1.0 - len(probe_comp) / len(probe)
+            use_compress = ratio >= COMPRESS_MIN_GAIN
 
     meta = json.dumps({
         "i": idx, "p": entry.rel_path,
         "s": entry.size, "c": entry.chunks, "m": entry.mtime,
         "retry": attempt,
-        "nc": not use_compress,   # nc=True means no compression used
+        "nc": not use_compress,
+        "resume_from": resume_from,   # NEW: tell receiver where we're starting
     }).encode()
     _send_frame(sock, T_FILE_META, meta)
 
-    # ── pipeline: send all chunks without waiting for per-chunk ACK ──────────
-    prog = None if quiet else Progress(entry.rel_path, entry.size)
-    file_hasher = hashlib.sha256()
+    # ── pipeline: send chunks from resume_from onward ─────────────────────────
+    already_done = resume_from * CHUNK_SIZE
+    display_size = max(entry.size - already_done, 0)
+    prog = None if quiet else Progress(entry.rel_path, max(display_size, 1))
+    file_hasher = hashlib.sha256()  # hash only the chunks we send
 
-    for ci, raw in enumerate(_read_chunks_async(entry.abs_path)):
-        file_hasher.update(raw)
-        chunk_hash = _sha256(raw)
-        if use_compress:
-            data = _compress(raw)
-            flags = FLAG_COMPRESSED
-        else:
-            data = raw
-            flags = FLAG_RAW
-        payload = struct.pack(CHUNK_HDR_FMT, ci, chunk_hash, len(data), flags) + data
-        _send_frame(sock, T_CHUNK, payload)
-        if prog:
-            prog.advance(len(raw))
+    with open(entry.abs_path, "rb") as fh:
+        fh.seek(already_done)
+        ci = resume_from
+        while True:
+            if cancel and cancel.is_set():
+                _send_frame(sock, T_CANCEL, b"")
+                return
+            raw = fh.read(CHUNK_SIZE)
+            if not raw:
+                break
+            file_hasher.update(raw)
+            chunk_hash = _sha256(raw)
+            if use_compress:
+                data = _compress(raw)
+                flags = FLAG_COMPRESSED
+            else:
+                data = raw
+                flags = FLAG_RAW
+            payload = struct.pack(CHUNK_HDR_FMT, ci, chunk_hash, len(data), flags) + data
+            _send_frame(sock, T_CHUNK, payload)
+            if prog:
+                prog.advance(len(raw))
+            ci += 1
 
     if prog:
         prog.finish()
 
-    # Send FILE_END with whole-file hash
+    # Send FILE_END with hash of transmitted chunks only
     file_hash = file_hasher.digest()
     _send_frame(sock, T_FILE_END, struct.pack("!I32s", idx, file_hash))
 
@@ -459,27 +560,29 @@ def _send_file(sock: socket.socket, idx: int, entry: FileEntry,
     ack = json.loads(pl)
 
     if t == T_FILE_END_ACK and ack.get("ok"):
-        return  # success
+        return
 
-    # Receiver reports bad chunk indices → retry those only
     bad: list[int] = ack.get("bad", [])
+    reason = ack.get("reason", "?")
     if bad:
         log.warning("%s: %d bad chunk(s): %s", entry.rel_path, len(bad), bad)
-    else:
-        log.warning("%s: file hash mismatch", entry.rel_path)
-
-    reason = ack.get("reason", "?")
     if attempt >= MAX_RETRY_FILES:
         raise RuntimeError(f"{entry.rel_path} failed after {MAX_RETRY_FILES} retries: {reason}")
 
     print(f"  Retry {attempt+1}/{MAX_RETRY_FILES} for {entry.rel_path} ({reason})")
-    _send_file(sock, idx, entry, quiet, attempt + 1)
-
-    # Final SESSION_END (called by caller after all files)
+    _send_file(sock, idx, entry, quiet, attempt + 1, resume_from=0, cancel=cancel)
 
 
 def _finish_session(sock: socket.socket) -> None:
     _send_frame(sock, T_SESSION_END, b"")
+
+
+def _cancel_session(sock: socket.socket) -> None:
+    """Send T_CANCEL and close — used for clean abort."""
+    try:
+        _send_frame(sock, T_CANCEL, b"")
+    except OSError:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -492,6 +595,7 @@ _print_lock = threading.Lock()
 def _send_parallel(
     entries: list[FileEntry], host: str, port: int,
     my_name: str, workers: int, quiet: bool,
+    cancel: threading.Event | None = None,
 ) -> None:
     """Send files across `workers` simultaneous TCP connections.
     Each connection carries a round-robin slice of the file list.
@@ -505,15 +609,11 @@ def _send_parallel(
     errors: list[Exception] = []
     err_lock = threading.Lock()
 
-    # Compute per-worker global offset (round-robin distribution)
-    # group i contains entries at indices i, i+workers, i+2*workers, ...
-    # so offset for group i = i  (since round-robin: groups[i%workers].append(e))
     g_total = len(entries)
     g_offsets = [0] * workers
     count = 0
     for i in range(workers):
         g_offsets[i] = count
-        # files assigned to worker i: ceil((g_total - i) / workers)
         assigned = len(groups[i])
         count += assigned
 
@@ -528,8 +628,11 @@ def _send_parallel(
         sock.settimeout(None)
         try:
             _send_session(sock, group, my_name, quiet,
-                          g_offset=g_off, g_total=g_total)
-            _finish_session(sock)
+                          g_offset=g_off, g_total=g_total, cancel=cancel)
+            if cancel and cancel.is_set():
+                _cancel_session(sock)
+            else:
+                _finish_session(sock)
         except Exception as e:
             with err_lock: errors.append(e)
         finally:
@@ -595,7 +698,35 @@ def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
         return
     info = json.loads(pl)
     sender = info.get("name", peer_ip)
-    _send_frame(sock, T_HELLO_ACK, json.dumps({"ok": True}).encode())
+
+    # ── Resume negotiation ────────────────────────────────────────────────────
+    # Build FileEntry list from manifest the sender included in HELLO
+    raw_manifest = info.get("manifest", [])
+    skip_list: list[int] = []
+    resume_dict: dict[int, int] = {}
+
+    if raw_manifest:
+        fake_entries = [
+            FileEntry(
+                abs_path=Path("/"),  # not used here
+                rel_path=m["p"],
+                size=int(m["s"]),
+                mtime=float(m["m"]),
+                chunks=max(1, -(-int(m["s"]) // CHUNK_SIZE)),
+            )
+            for m in raw_manifest
+        ]
+        skip_list, resume_dict = _check_receiver_state(fake_entries, dest_dir)
+        if skip_list:
+            print(f"  Resume: skipping {len(skip_list)} already-complete file(s)")
+        if resume_dict:
+            print(f"  Resume: continuing {len(resume_dict)} partial file(s)")
+
+    _send_frame(sock, T_HELLO_ACK, json.dumps({
+        "ok": True,
+        "skip": skip_list,
+        "resume": {str(k): v for k, v in resume_dict.items()},
+    }).encode())
 
     print(f"\n  <- {sender} ({peer_ip})  {info.get('files','?')} file(s)")
 
@@ -603,6 +734,9 @@ def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
         t, pl = _read_frame(sock)
         if t == T_SESSION_END:
             print(f"  OK Transfer from {sender} complete\n")
+            break
+        elif t == T_CANCEL:
+            print(f"  !! Transfer from {sender} was cancelled by sender", file=sys.stderr)
             break
         elif t == T_FILE_META:
             _recv_file(sock, json.loads(pl), dest_dir)
@@ -615,17 +749,18 @@ import queue as _queue  # noqa: E402  (stdlib)
 
 
 def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
-    idx      = meta["i"]
-    rel_path = meta["p"]
-    total    = meta["s"]
-    n_chunks = meta["c"]
-    mtime    = meta["m"]
-    no_comp  = meta.get("nc", False)   # True = sender sent raw (no zlib)
+    idx       = meta["i"]
+    rel_path  = meta["p"]
+    total     = meta["s"]
+    n_chunks  = meta["c"]
+    mtime     = meta["m"]
+    no_comp   = meta.get("nc", False)
+    resume_from = int(meta.get("resume_from", 0))   # chunk index sender started from
 
     # Security: block path traversal
     rel = Path(rel_path)
     if rel.is_absolute() or ".." in rel.parts:
-        for _ in range(n_chunks): _read_frame(sock)
+        for _ in range(n_chunks - resume_from): _read_frame(sock)
         _read_frame(sock)  # FILE_END
         _send_frame(sock, T_FILE_END_ACK,
                     json.dumps({"ok": False, "reason": "unsafe path"}).encode())
@@ -633,22 +768,29 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
 
     dest = dest_dir / rel
     dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".ldtpart")
 
     is_retry = meta.get("retry", 0) > 0
     label = f"{'retry ' if is_retry else ''}{rel_path}"
+    if resume_from:
+        label = f"resume {rel_path} (chunk {resume_from}+)"
     print(f"  >> {label}  ({_fmt(total).strip()})")
-    prog = Progress(rel_path, total)
 
-    # ── async write queue so disk I/O never blocks socket reads ──────────────
+    # Progress shows only what we're receiving now
+    recv_size = max(total - resume_from * CHUNK_SIZE, 1)
+    prog = Progress(rel_path, recv_size)
+
+    # ── async write queue ─────────────────────────────────────────────────────
     write_q: _queue.Queue[bytes | None] = _queue.Queue(maxsize=4)
     write_error: list[Exception] = []
 
     def _writer() -> None:
         try:
-            with open(dest, "wb") as fh:
+            mode = "ab" if resume_from else "wb"   # append for resume
+            with open(part, mode) as fh:
                 while True:
                     block = write_q.get()
-                    if block is None:   # sentinel
+                    if block is None:
                         break
                     fh.write(block)
         except Exception as e:
@@ -657,16 +799,32 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     writer_thread = threading.Thread(target=_writer, daemon=True, name="ldt-write")
     writer_thread.start()
 
-    # ── receive all chunks ────────────────────────────────────────────────────
+    # ── load resume manifest to continue hashing ──────────────────────────────
+    manifest = _load_manifest(dest_dir)
     file_hasher = hashlib.sha256()
-    bad_chunks: list[int] = []
+    # If resuming, we need to replay hash of already-saved bytes
+    if resume_from and part.exists():
+        with open(part, "rb") as fh:
+            for block in iter(lambda: fh.read(CHUNK_SIZE), b""):
+                file_hasher.update(block)
 
-    for _ in range(n_chunks):
+    bad_chunks: list[int] = []
+    chunks_received = resume_from
+
+    # ── receive all chunks ────────────────────────────────────────────────────
+    for _ in range(n_chunks - resume_from):
         t, pl = _read_frame(sock)
-        if t == T_ERROR:
+
+        if t in (T_ERROR, T_CANCEL):
+            # Sender cancelled or errored — keep .ldtpart for resume later
             write_q.put(None)
             writer_thread.join()
-            print(f"\n  !! sender error mid-transfer", file=sys.stderr)
+            manifest[rel_path] = {"chunks": chunks_received, "size": total}
+            _save_manifest(dest_dir, manifest)
+            if t == T_CANCEL:
+                print(f"  !! Sender cancelled — partial file kept for resume")
+            else:
+                print(f"  !! Sender error mid-transfer — partial kept", file=sys.stderr)
             return
 
         if t != T_CHUNK:
@@ -682,37 +840,38 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
             except zlib.error as e:
                 log.warning("Chunk %d decompress error: %s", ci, e)
                 bad_chunks.append(ci)
-                write_q.put(b"\x00" * (CHUNK_SIZE if ci < n_chunks - 1 else total % CHUNK_SIZE or CHUNK_SIZE))
+                write_q.put(b"\x00" * CHUNK_SIZE)
                 continue
         else:
-            raw = raw_data   # raw passthrough — no decompression needed
+            raw = raw_data
 
         if _sha256(raw) != expected_hash:
             log.warning("Chunk %d hash mismatch", ci)
             bad_chunks.append(ci)
-            write_q.put(raw)   # write to keep file position correct
+            write_q.put(raw)
         else:
             file_hasher.update(raw)
             write_q.put(raw)
+            chunks_received += 1
 
         prog.advance(len(raw))
 
-    # Signal writer to finish, wait for all disk writes to complete
+    # ── wait for all writes to complete ──────────────────────────────────────
     write_q.put(None)
     writer_thread.join()
 
     if write_error:
         print(f"  !! Write error: {write_error[0]}", file=sys.stderr)
-        dest.unlink(missing_ok=True)
-        # drain FILE_END
-        _read_frame(sock)
+        manifest[rel_path] = {"chunks": chunks_received, "size": total}
+        _save_manifest(dest_dir, manifest)
+        _read_frame(sock)  # drain FILE_END
         _send_frame(sock, T_FILE_END_ACK,
                     json.dumps({"ok": False, "reason": f"write error: {write_error[0]}"}).encode())
         return
 
     prog.finish()
 
-    # FILE_END with whole-file hash
+    # ── FILE_END with transmitted-chunk hash ──────────────────────────────────
     t, pl = _read_frame(sock)
     if t != T_FILE_END:
         _send_frame(sock, T_FILE_END_ACK,
@@ -723,15 +882,30 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     actual_hash = file_hasher.digest()
 
     if bad_chunks or actual_hash != sender_hash:
-        dest.unlink(missing_ok=True)
+        # Keep partial for next attempt
+        manifest[rel_path] = {"chunks": resume_from, "size": total}  # restart from before resume
+        _save_manifest(dest_dir, manifest)
+        part.unlink(missing_ok=True)  # bad data — restart from 0
         _send_frame(sock, T_FILE_END_ACK, json.dumps({
             "ok": False, "reason": "hash mismatch", "bad": bad_chunks,
         }).encode())
         print(f"  !! {rel_path}: hash mismatch -- will retry", file=sys.stderr)
         return
 
-    try: os.utime(dest, (mtime, mtime))
+    # ── Success: rename .ldtpart → final, clean manifest ─────────────────────
+    try: os.utime(part, (mtime, mtime))
     except OSError: pass
+
+    # Atomic rename
+    try:
+        part.replace(dest)
+    except OSError:
+        import shutil
+        shutil.move(str(part), str(dest))
+
+    # Remove from resume manifest
+    manifest.pop(rel_path, None)
+    _save_manifest(dest_dir, manifest)
 
     _send_frame(sock, T_FILE_END_ACK, json.dumps({"ok": True}).encode())
     print(f"  OK saved -> {dest}")
@@ -865,16 +1039,20 @@ Commands:
   send <target> <path> [<path>...]  Send files/folders to a peer
        --workers N                 Use N parallel connections (default 1)
   dir [PATH]                       Change/show save directory for received files
+  quiet                            Toggle quiet mode (no progress bars)
   help                             Show this message
-  exit                             Quit
+  exit                             Quit (Ctrl-C during a send cancels it; Ctrl-C at prompt exits)
 """
 
 
 def _do_send_interactive(
     disc: Discovery, line_parts: list[str],
     my_name: str, port: int, quiet: bool,
+    cancel: threading.Event,
 ) -> None:
-    """Parse and execute a `send` command entered at the interactive prompt."""
+    """Parse and execute a `send` command entered at the interactive prompt.
+    `cancel` is set to abort mid-transfer; checked between every chunk.
+    """
     # Parse workers flag
     workers = 1
     clean: list[str] = []
@@ -906,6 +1084,9 @@ def _do_send_interactive(
     deadline = time.monotonic() + 3
     peer = None
     while time.monotonic() < deadline:
+        if cancel.is_set():
+            print("  Cancelled.")
+            return
         peer = disc.find(target)
         if peer: break
         time.sleep(0.2)
@@ -916,6 +1097,10 @@ def _do_send_interactive(
     else:
         host, p_port = target, port
         print(f"  Peer '{target}' not found — trying {host}:{p_port} directly")
+
+    if cancel.is_set():
+        print("  Cancelled.")
+        return
 
     total = sum(e.size for e in entries)
     workers = min(workers, len(entries))
@@ -930,12 +1115,21 @@ def _do_send_interactive(
             sock.connect((host, p_port))
             sock.settimeout(None)
             try:
-                _send_session(sock, entries, my_name, quiet)
-                _finish_session(sock)
+                _send_session(sock, entries, my_name, quiet, cancel=cancel)
+                if not cancel.is_set():
+                    _finish_session(sock)
+                else:
+                    _cancel_session(sock)
+                    print("\n  Transfer cancelled.")
+                    return
             finally:
                 sock.close()
         else:
-            _send_parallel(entries, host, p_port, my_name, workers, quiet)
+            _send_parallel(entries, host, p_port, my_name, workers, quiet,
+                           cancel=cancel)
+            if cancel.is_set():
+                print("\n  Transfer cancelled.")
+                return
         dt = time.monotonic() - t0
         speed = total / dt if dt else 0
         print(f"\n  Done  {_fmt(total).strip()} in {_fmt_t(dt)}  ({_fmt(speed).strip()}/s)")
@@ -959,7 +1153,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                      daemon=True, name="ldt-server").start()
 
     print(f"LDT  |  {args.name}  |  port {args.port}  |  saving to {recv_dir}")
-    print("Ready. Type 'help' for commands, Ctrl-C to exit.\n")
+    print("Ready. Type 'help' for commands, Ctrl-C cancels send / exits.\n")
 
     quiet = False
 
@@ -967,7 +1161,10 @@ def cmd_interactive(args: argparse.Namespace) -> int:
         while True:
             try:
                 line = input("ldt> ").strip()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                # Ctrl-C at the prompt → exit
                 break
 
             if not line:
@@ -1001,7 +1198,23 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                     print()
 
             elif cmd == "send":
-                _do_send_interactive(disc, rest, args.name, args.port, quiet)
+                _active_cancel = threading.Event()
+                _send_thread = threading.Thread(
+                    target=_do_send_interactive,
+                    args=(disc, rest, args.name, args.port, quiet, _active_cancel),
+                    daemon=True, name="ldt-send",
+                )
+                _send_thread.start()
+                try:
+                    _send_thread.join()
+                except KeyboardInterrupt:
+                    # Ctrl-C during send → cancel only the transfer
+                    print("\n  Cancelling... (press Ctrl-C again to force-quit)")
+                    _active_cancel.set()
+                    try:
+                        _send_thread.join(timeout=5)
+                    except KeyboardInterrupt:
+                        pass  # force quit on second Ctrl-C
 
             elif cmd == "dir":
                 if rest:
