@@ -96,6 +96,8 @@ T_FILE_META    = 0x10
 T_CHUNK        = 0x11               # no per-chunk ACK — pipelined
 T_FILE_END     = 0x13               # sender: file_index + file_sha256
 T_FILE_END_ACK = 0x14               # receiver: ok | bad_chunks list
+T_EXEC         = 0x15               # sender: JSON {"cmd": "..."}
+T_EXEC_RESULT  = 0x16               # receiver: JSON {"stdout": "...", "stderr": "...", "rc": 0}
 T_SESSION_END  = 0x20
 T_CANCEL       = 0x21               # either side: abort current transfer cleanly
 T_ERROR        = 0xFF
@@ -336,27 +338,39 @@ def _read_chunks_async(path: Path) -> Iterator[bytes]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROGRESS BAR
+# PROGRESS BAR & COORDINATION
 # ─────────────────────────────────────────────────────────────────────────────
+
+_print_lock = threading.Lock()
+
 
 class Progress:
     BAR = 28
 
-    def __init__(self, label: str, total: int) -> None:
+    def __init__(self, label: str, total: int, quiet: bool = False) -> None:
         self._label = label[-20:] if len(label) > 20 else label
         self._total = max(total, 1)
         self._done = 0
         self._t0 = time.monotonic()
         self._last = 0.0
+        self._quiet = quiet
 
     def advance(self, n: int) -> None:
+        if self._quiet: return
         self._done += n
         now = time.monotonic()
         if now - self._last >= 0.15 or self._done >= self._total:
-            self._last = now; self._draw()
+            self._last = now
+            with _print_lock:
+                self._draw()
 
     def finish(self) -> None:
-        self._done = self._total; self._draw(); sys.stderr.write("\n"); sys.stderr.flush()
+        if self._quiet: return
+        self._done = self._total
+        with _print_lock:
+            self._draw()
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
     def _draw(self) -> None:
         pct = self._done / self._total
@@ -368,6 +382,51 @@ class Progress:
             f"\r  {self._label:<20} [{bar}] {pct*100:5.1f}%"
             f"  {_fmt(speed)}/s  ETA {_fmt_t(eta)}"
         ); sys.stderr.flush()
+
+
+class _SharedProgress:
+    """Coordinated progress bar for parallel workers."""
+    BAR = 28
+
+    def __init__(self, n_files: int, total_bytes: int) -> None:
+        self.n_files = n_files
+        self.total_bytes = max(total_bytes, 1)
+        self.done_bytes = 0
+        self.done_files = 0
+        self.lock = threading.Lock()
+        self.t0 = time.monotonic()
+        self.last_draw = 0.0
+
+    def file_done(self) -> None:
+        with self.lock:
+            self.done_files += 1
+
+    def advance(self, n: int) -> None:
+        with self.lock:
+            self.done_bytes += n
+            now = time.monotonic()
+            if now - self.last_draw < 0.2 and self.done_bytes < self.total_bytes:
+                return
+            self.last_draw = now
+            
+        # Draw outside lock but under _print_lock
+        with _print_lock:
+            pct = self.done_bytes / self.total_bytes
+            bar = "#" * int(self.BAR * pct) + "." * (self.BAR - int(self.BAR * pct))
+            dt = time.monotonic() - self.t0
+            speed = self.done_bytes / dt if dt else 0
+            eta = (self.total_bytes - self.done_bytes) / speed if speed > 0 else 0
+            sys.stderr.write(
+                f"\r  Progress [{bar}] {pct*100:5.1f}%  ({self.done_files}/{self.n_files} files)"
+                f"  {_fmt(speed)}/s  ETA {_fmt_t(eta)}    "
+            ); sys.stderr.flush()
+
+    def finish(self) -> None:
+        self.done_bytes = self.total_bytes
+        self.advance(0)
+        with _print_lock:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 def _fmt(n: float) -> str:
@@ -469,6 +528,7 @@ def _send_session(
     my_name: str, quiet: bool = False,
     g_offset: int = 0, g_total: int = 0,
     cancel: threading.Event | None = None,
+    shared_prog: _SharedProgress | None = None,
 ) -> None:
     """g_offset / g_total: global file numbering for parallel workers.
     cancel: set this Event to abort cleanly with T_CANCEL.
@@ -498,20 +558,26 @@ def _send_session(
             return
 
         if idx in skip_set:
-            print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
-                  f"({_fmt(entry.size).strip()})  -- SKIP (already on receiver)")
+            if not quiet and not shared_prog:
+                with _print_lock:
+                    print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
+                          f"({_fmt(entry.size).strip()})  -- SKIP (already on receiver)")
+            if shared_prog:
+                shared_prog.advance(entry.size)
+                shared_prog.file_done()
             continue
 
         resume_from = resume_map.get(idx, 0)
-        if resume_from:
-            print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
-                  f"({_fmt(entry.size).strip()})  -- RESUME from chunk {resume_from}")
-        else:
-            print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
-                  f"({_fmt(entry.size).strip()})")
+        if not quiet and not shared_prog:
+            with _print_lock:
+                resume_label = f" -- RESUME from chunk {resume_from}" if resume_from else ""
+                print(f"  [{global_idx}/{total_label}] {entry.rel_path}  "
+                      f"({_fmt(entry.size).strip()}){resume_label}")
 
         _send_file(sock, idx, entry, quiet, attempt=0,
-                   resume_from=resume_from, cancel=cancel)
+                   resume_from=resume_from, cancel=cancel, shared_prog=shared_prog)
+        if shared_prog:
+            shared_prog.file_done()
 
 
 def _send_file(
@@ -519,6 +585,7 @@ def _send_file(
     quiet: bool, attempt: int = 0,
     resume_from: int = 0,
     cancel: threading.Event | None = None,
+    shared_prog: _SharedProgress | None = None,
 ) -> None:
     """Stream one file; retry on whole-file hash mismatch (up to MAX_RETRY_FILES)."""
 
@@ -546,7 +613,12 @@ def _send_file(
     # ── pipeline: send chunks; hash entire file for integrity ───────────────
     already_done = resume_from * CHUNK_SIZE
     display_size = max(entry.size - already_done, 0)
-    prog = None if quiet else Progress(entry.rel_path, max(display_size, 1))
+    
+    # Use shared progress if in parallel mode, else local one
+    prog = None
+    if not quiet and not shared_prog:
+        prog = Progress(entry.rel_path, max(display_size, 1))
+    
     file_hasher = hashlib.sha256()
 
     with open(entry.abs_path, "rb") as fh:
@@ -581,6 +653,8 @@ def _send_file(
             _send_frame(sock, T_CHUNK, payload)
             if prog:
                 prog.advance(len(raw))
+            if shared_prog:
+                shared_prog.advance(len(raw))
             ci += 1
 
     if prog:
@@ -605,7 +679,8 @@ def _send_file(
         raise RuntimeError(f"{entry.rel_path} failed after {MAX_RETRY_FILES} retries: {reason}")
 
     print(f"  Retry {attempt+1}/{MAX_RETRY_FILES} for {entry.rel_path} ({reason})")
-    _send_file(sock, idx, entry, quiet, attempt + 1, resume_from=0, cancel=cancel)
+    _send_file(sock, idx, entry, quiet, attempt + 1, resume_from=0,
+               cancel=cancel, shared_prog=shared_prog)
 
 
 def _finish_session(sock: socket.socket) -> None:
@@ -645,6 +720,9 @@ def _send_parallel(
     err_lock = threading.Lock()
 
     g_total = len(entries)
+    total_bytes = sum(e.size for e in entries)
+    shared_prog = None if quiet else _SharedProgress(g_total, total_bytes)
+    
     g_offsets = [0] * workers
     count = 0
     for i in range(workers):
@@ -663,7 +741,8 @@ def _send_parallel(
         sock.settimeout(None)
         try:
             _send_session(sock, group, my_name, quiet,
-                          g_offset=g_off, g_total=g_total, cancel=cancel)
+                          g_offset=g_off, g_total=g_total, cancel=cancel,
+                          shared_prog=shared_prog)
             if cancel and cancel.is_set():
                 _cancel_session(sock)
             else:
@@ -680,6 +759,9 @@ def _send_parallel(
     ]
     for t in threads: t.start()
     for t in threads: t.join()
+
+    if shared_prog:
+        shared_prog.finish()
 
     if errors:
         raise errors[0]
@@ -698,7 +780,7 @@ def _recv_server(dest_dir: Path, port: int) -> socket.socket:
     return s
 
 
-def _recv_loop(server: socket.socket, dest_dir: Path, stop: threading.Event) -> None:
+def _recv_loop(server: socket.socket, dest_dir: Path, stop: threading.Event, allow_exec: bool = False) -> None:
     while not stop.is_set():
         try:
             conn, addr = server.accept()
@@ -707,15 +789,15 @@ def _recv_loop(server: socket.socket, dest_dir: Path, stop: threading.Event) -> 
         except OSError:
             break
         threading.Thread(
-            target=_recv_conn, args=(conn, addr[0], dest_dir),
+            target=_recv_conn, args=(conn, addr[0], dest_dir, allow_exec),
             daemon=True, name=f"ldt-{addr[0]}"
         ).start()
 
 
-def _recv_conn(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
+def _recv_conn(sock: socket.socket, peer_ip: str, dest_dir: Path, allow_exec: bool = False) -> None:
     try:
         _tune(sock)
-        _recv_session(sock, peer_ip, dest_dir)
+        _recv_session(sock, peer_ip, dest_dir, allow_exec=allow_exec)
     except EOFError:
         pass
     except Exception as e:
@@ -725,7 +807,7 @@ def _recv_conn(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
         except OSError: pass
 
 
-def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
+def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path, allow_exec: bool = False) -> None:
     t, pl = _read_frame(sock)
     if t != T_HELLO:
         _send_frame(sock, T_HELLO_ACK,
@@ -775,6 +857,24 @@ def _recv_session(sock: socket.socket, peer_ip: str, dest_dir: Path) -> None:
             break
         elif t == T_FILE_META:
             _recv_file(sock, json.loads(pl), dest_dir)
+        elif t == T_EXEC:
+            info = json.loads(pl)
+            cmd = info.get("cmd", "")
+            if not allow_exec:
+                _send_frame(sock, T_EXEC_RESULT, json.dumps({
+                    "rc": 1, "stderr": "Remote execution is disabled on this peer (use --allow-exec to enable)."
+                }).encode())
+            else:
+                try:
+                    import subprocess
+                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                    _send_frame(sock, T_EXEC_RESULT, json.dumps({
+                        "rc": res.returncode, "stdout": res.stdout, "stderr": res.stderr
+                    }).encode())
+                except Exception as e:
+                    _send_frame(sock, T_EXEC_RESULT, json.dumps({
+                        "rc": 1, "stderr": str(e)
+                    }).encode())
         elif t == T_ERROR:
             print(f"  !! {json.loads(pl).get('msg','?')}", file=sys.stderr)
             break
@@ -955,10 +1055,12 @@ def cmd_receive(args: argparse.Namespace) -> int:
 
     server = _recv_server(dest, args.port)
     stop = threading.Event()
-    threading.Thread(target=_recv_loop, args=(server, dest, stop),
+    threading.Thread(target=_recv_loop, args=(server, dest, stop, args.allow_exec),
                      daemon=True, name="ldt-server").start()
 
     print(f"LDT  |  name: {args.name}  |  port: {args.port}  |  saving to: {dest}")
+    if args.allow_exec:
+        print("  WARNING: Remote execution is ENABLED on this machine.")
     print("Waiting for transfers...  (Ctrl-C to stop)\n")
     try:
         while True: time.sleep(1)
@@ -1071,9 +1173,59 @@ Commands:
        --workers N                 Use N parallel connections (default 1)
   dir [PATH]                       Change/show save directory for received files
   quiet                            Toggle quiet mode (no progress bars)
+  exec <target> <cmd>             Execute a shell command on a peer
   help                             Show this message
   exit                             Quit (Ctrl-C during a send cancels it; Ctrl-C at prompt exits)
 """
+
+
+def _do_exec_interactive(
+    disc: Discovery, target: str, cmd: str,
+    my_name: str, port: int,
+) -> None:
+    """Send T_EXEC to a peer and wait for T_EXEC_RESULT."""
+    # Resolve peer
+    disc.query()
+    deadline = time.monotonic() + 3
+    peer = None
+    while time.monotonic() < deadline:
+        peer = disc.find(target)
+        if peer: break
+        time.sleep(0.2)
+
+    if peer:
+        host, p_port = peer.host, peer.port
+    else:
+        host, p_port = target, port
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(15)
+        sock.connect((host, p_port))
+        sock.settimeout(None)
+        try:
+            # HELLO
+            _send_frame(sock, T_HELLO, json.dumps({"name": my_name, "files": 0}).encode())
+            t, pl = _read_frame(sock)
+            
+            # T_EXEC
+            _send_frame(sock, T_EXEC, json.dumps({"cmd": cmd}).encode())
+            t, pl = _read_frame(sock)
+            if t == T_EXEC_RESULT:
+                res = json.loads(pl)
+                print(f"\n  --- Result from {target} ---")
+                if res.get("stdout"):
+                    print(res["stdout"])
+                if res.get("stderr"):
+                    print(res["stderr"], file=sys.stderr)
+                print(f"  --- Return Code: {res.get('rc')} ---")
+            else:
+                print(f"  !! Unexpected response: {t}")
+            _finish_session(sock)
+        finally:
+            sock.close()
+    except Exception as e:
+        print(f"  !! Exec failed: {e}")
 
 
 def _do_send_interactive(
@@ -1180,10 +1332,12 @@ def cmd_interactive(args: argparse.Namespace) -> int:
 
     server = _recv_server(recv_dir, args.port)
     stop = threading.Event()
-    threading.Thread(target=_recv_loop, args=(server, recv_dir, stop),
+    threading.Thread(target=_recv_loop, args=(server, recv_dir, stop, args.allow_exec),
                      daemon=True, name="ldt-server").start()
 
     print(f"LDT  |  {args.name}  |  port {args.port}  |  saving to {recv_dir}")
+    if args.allow_exec:
+        print("  WARNING: Remote execution is ENABLED on this machine.")
     print("Ready. Type 'help' for commands, Ctrl-C cancels send / exits.\n")
 
     quiet = False
@@ -1260,7 +1414,7 @@ def cmd_interactive(args: argparse.Namespace) -> int:
                         stop = threading.Event()
                         server = _recv_server(recv_dir, args.port)
                         threading.Thread(
-                            target=_recv_loop, args=(server, recv_dir, stop),
+                            target=_recv_loop, args=(server, recv_dir, stop, args.allow_exec),
                             daemon=True, name="ldt-server"
                         ).start()
                         print(f"  Saving to: {recv_dir}")
@@ -1272,6 +1426,13 @@ def cmd_interactive(args: argparse.Namespace) -> int:
             elif cmd == "quiet":
                 quiet = not quiet
                 print(f"  Quiet mode: {'on' if quiet else 'off'}")
+
+            elif cmd == "exec":
+                if len(rest) < 2:
+                    print("  Usage: exec <target> <command>")
+                else:
+                    target, command = rest[0], " ".join(rest[1:])
+                    _do_exec_interactive(disc, target, command, args.name, args.port)
 
             else:
                 print(f"  Unknown command: '{cmd}'  (type 'help')")
@@ -1308,6 +1469,8 @@ examples:
                    help=f"UDP/TCP port (default {TCP_PORT})")
     p.add_argument("--dir", default="./received",
                    help="Directory for received files (default: ./received)")
+    p.add_argument("--allow-exec", action="store_true", default=True,
+                   help="Allow remote commands to be executed on this machine (SECURITY RISK)")
     p.add_argument("-v", "--verbose", action="store_true")
 
     sub = p.add_subparsers(dest="cmd", required=False)
