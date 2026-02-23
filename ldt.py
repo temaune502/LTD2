@@ -389,11 +389,16 @@ def _fmt_t(s: float) -> str:
 # RESUME HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Global lock — protects manifest from concurrent writes by parallel-worker threads
+_manifest_lock = threading.Lock()
+
+
 def _resume_manifest_path(dest_dir: Path) -> Path:
     return dest_dir / RESUME_DIR / "manifest.json"
 
 
 def _load_manifest(dest_dir: Path) -> dict:
+    """Read manifest (must be called while holding _manifest_lock)."""
     p = _resume_manifest_path(dest_dir)
     if p.exists():
         try:
@@ -403,12 +408,31 @@ def _load_manifest(dest_dir: Path) -> dict:
     return {}
 
 
-def _save_manifest(dest_dir: Path, manifest: dict) -> None:
+def _write_manifest(dest_dir: Path, m: dict) -> None:
+    """Write manifest atomically (must be called while holding _manifest_lock)."""
     p = _resume_manifest_path(dest_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(manifest), encoding="utf-8")
+    # Use thread-ID in temp-name so concurrent calls never collide
+    tmp = p.with_name(f"manifest_{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(m), encoding="utf-8")
     tmp.replace(p)
+
+
+def _manifest_set(dest_dir: Path, key: str, value: dict) -> None:
+    """Atomically add/update one entry in the manifest."""
+    with _manifest_lock:
+        m = _load_manifest(dest_dir)
+        m[key] = value
+        _write_manifest(dest_dir, m)
+
+
+def _manifest_remove(dest_dir: Path, key: str) -> None:
+    """Atomically delete one entry from the manifest."""
+    with _manifest_lock:
+        m = _load_manifest(dest_dir)
+        if key in m:
+            del m[key]
+            _write_manifest(dest_dir, m)
 
 
 def _check_receiver_state(
@@ -417,7 +441,8 @@ def _check_receiver_state(
     """Check dest_dir for completed / partial files.
     Returns (skip_indices, resume_map) where resume_map maps idx→chunk_count.
     """
-    manifest = _load_manifest(dest_dir)
+    with _manifest_lock:
+        manifest = _load_manifest(dest_dir)
     skip: list[int] = []
     resume: dict[int, int] = {}
 
@@ -518,14 +543,24 @@ def _send_file(
     }).encode()
     _send_frame(sock, T_FILE_META, meta)
 
-    # ── pipeline: send chunks from resume_from onward ─────────────────────────
+    # ── pipeline: send chunks; hash entire file for integrity ───────────────
     already_done = resume_from * CHUNK_SIZE
     display_size = max(entry.size - already_done, 0)
     prog = None if quiet else Progress(entry.rel_path, max(display_size, 1))
-    file_hasher = hashlib.sha256()  # hash only the chunks we send
+    file_hasher = hashlib.sha256()
 
     with open(entry.abs_path, "rb") as fh:
-        fh.seek(already_done)
+        # Pre-hash the skipped prefix so full-file hash matches receiver
+        if resume_from:
+            remaining = already_done
+            while remaining > 0:
+                block = fh.read(min(CHUNK_SIZE, remaining))
+                if not block:
+                    break
+                file_hasher.update(block)
+                remaining -= len(block)
+
+        # Send chunks from resume_from onward
         ci = resume_from
         while True:
             if cancel and cancel.is_set():
@@ -551,7 +586,7 @@ def _send_file(
     if prog:
         prog.finish()
 
-    # Send FILE_END with hash of transmitted chunks only
+    # FILE_END carries full-file hash (from byte 0)
     file_hash = file_hasher.digest()
     _send_frame(sock, T_FILE_END, struct.pack("!I32s", idx, file_hash))
 
@@ -799,8 +834,7 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
     writer_thread = threading.Thread(target=_writer, daemon=True, name="ldt-write")
     writer_thread.start()
 
-    # ── load resume manifest to continue hashing ──────────────────────────────
-    manifest = _load_manifest(dest_dir)
+    # ── Hash already-saved bytes if resuming ──────────────────────────────────
     file_hasher = hashlib.sha256()
     # If resuming, we need to replay hash of already-saved bytes
     if resume_from and part.exists():
@@ -819,8 +853,7 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
             # Sender cancelled or errored — keep .ldtpart for resume later
             write_q.put(None)
             writer_thread.join()
-            manifest[rel_path] = {"chunks": chunks_received, "size": total}
-            _save_manifest(dest_dir, manifest)
+            _manifest_set(dest_dir, rel_path, {"chunks": chunks_received, "size": total})
             if t == T_CANCEL:
                 print(f"  !! Sender cancelled — partial file kept for resume")
             else:
@@ -862,8 +895,7 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
 
     if write_error:
         print(f"  !! Write error: {write_error[0]}", file=sys.stderr)
-        manifest[rel_path] = {"chunks": chunks_received, "size": total}
-        _save_manifest(dest_dir, manifest)
+        _manifest_set(dest_dir, rel_path, {"chunks": chunks_received, "size": total})
         _read_frame(sock)  # drain FILE_END
         _send_frame(sock, T_FILE_END_ACK,
                     json.dumps({"ok": False, "reason": f"write error: {write_error[0]}"}).encode())
@@ -883,8 +915,7 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
 
     if bad_chunks or actual_hash != sender_hash:
         # Keep partial for next attempt
-        manifest[rel_path] = {"chunks": resume_from, "size": total}  # restart from before resume
-        _save_manifest(dest_dir, manifest)
+        _manifest_set(dest_dir, rel_path, {"chunks": resume_from, "size": total})  # restart from before resume
         part.unlink(missing_ok=True)  # bad data — restart from 0
         _send_frame(sock, T_FILE_END_ACK, json.dumps({
             "ok": False, "reason": "hash mismatch", "bad": bad_chunks,
@@ -904,8 +935,8 @@ def _recv_file(sock: socket.socket, meta: dict, dest_dir: Path) -> None:
         shutil.move(str(part), str(dest))
 
     # Remove from resume manifest
-    manifest.pop(rel_path, None)
-    _save_manifest(dest_dir, manifest)
+    _manifest_remove(dest_dir, rel_path)
+
 
     _send_frame(sock, T_FILE_END_ACK, json.dumps({"ok": True}).encode())
     print(f"  OK saved -> {dest}")
